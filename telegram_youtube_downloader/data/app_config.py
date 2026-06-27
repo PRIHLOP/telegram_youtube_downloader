@@ -36,6 +36,8 @@ class TelegramBotOptions:
 	text_timeout_seconds: int
 	video_timeout_seconds: int
 	audio_timeout_seconds: int
+	max_parallel_downloads: int
+	max_parallel_downloads_per_user: int
 	base_url: Optional[str] = None
 	default_command: Optional[DefaultCommandType] = None
 	authorization_options: AuthorizationOptions = field(

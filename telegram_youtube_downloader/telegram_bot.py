@@ -1,5 +1,6 @@
 import logging
 import textwrap
+import threading
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -29,6 +30,11 @@ from telegram_youtube_downloader.decorators.telegram_bot_command_interceptor imp
 
 
 class TelegramBot:
+	__download_queued_message = "Your request has been queued and will start soon."
+	__user_download_limit_message = (
+		"You already have a queued or active download. Please wait until it finishes."
+	)
+
 	def __init__(self) -> None:
 		self.__bot_key = ApiKeyUtils.get_telegram_bot_key()
 		self.__logger = logging.getLogger(f"tyd.{self.__class__.__name__}")
@@ -36,6 +42,22 @@ class TelegramBot:
 		self.__app_config = ConfigUtils.get_app_config()
 		self.__base_url = self.__app_config.telegram_bot_options.base_url
 		self.__default_command = self.__app_config.telegram_bot_options.default_command
+		self.__max_parallel_downloads = (
+			self.__app_config.telegram_bot_options.max_parallel_downloads
+		)
+		self.__max_parallel_downloads_per_user = (
+			self.__app_config.telegram_bot_options.max_parallel_downloads_per_user
+		)
+		if self.__max_parallel_downloads < 1:
+			raise ValueError("telegram_bot_options.max_parallel_downloads must be greater than 0")
+		if self.__max_parallel_downloads_per_user < 1:
+			raise ValueError(
+				"telegram_bot_options.max_parallel_downloads_per_user must be greater than 0"
+			)
+
+		self.__download_semaphore = threading.Semaphore(self.__max_parallel_downloads)
+		self.__user_download_semaphores: dict[int, threading.Semaphore] = {}
+		self.__user_download_semaphores_lock = threading.Lock()
 
 		self.downloader = YoutubeDownloader()
 		self.media_sender = TelegramMediaSender()
@@ -49,6 +71,43 @@ class TelegramBot:
 			formatted_title = formatted_title[:title_length]
 			formatted_title += "..."
 		return formatted_title
+
+	def __try_start_download_thread(
+		self,
+		url: str,
+		user_id: int,
+		chat_id: int,
+		content_type: ContentType,
+		dl_format_name: "str | None",
+	) -> bool:
+		with self.__user_download_semaphores_lock:
+			user_download_semaphore = self.__user_download_semaphores.setdefault(
+				user_id,
+				threading.Semaphore(self.__max_parallel_downloads_per_user),
+			)
+
+		if not user_download_semaphore.acquire(blocking=False):
+			self.__logger.info(f"Download rejected because user limit is reached ({user_id})")
+			return False
+
+		dt = DownloadThread(
+			downloader=self.downloader,
+			media_sender=self.media_sender,
+			url=url,
+			chat_id=chat_id,
+			content_type=content_type,
+			dl_format_name=dl_format_name,
+			download_semaphore=self.__download_semaphore,
+			user_download_semaphore=user_download_semaphore,
+		)
+
+		try:
+			dt.start()
+		except Exception:
+			user_download_semaphore.release()
+			raise
+
+		return True
 
 	def start(self):
 		"""Starts pooling (blocking)"""
@@ -140,6 +199,7 @@ class TelegramBot:
 				raise ValueError()
 
 			chat_id = message.chat.id
+			user_id = message.from_user.id if message.from_user is not None else chat_id
 
 			# Check arguments
 			if len(args) == 2:
@@ -147,17 +207,17 @@ class TelegramBot:
 			else:
 				url, dl_format_name = args[0], None
 
-			await message.reply_text("⬇️🎧 Download Starting...")
-
-			dt = DownloadThread(
-				downloader=self.downloader,
-				media_sender=self.media_sender,
+			if not self.__try_start_download_thread(
 				url=url,
+				user_id=user_id,
 				chat_id=chat_id,
 				content_type=ContentType.AUDIO,
 				dl_format_name=dl_format_name,
-			)
-			dt.start()
+			):
+				await message.reply_text(self.__user_download_limit_message)
+				return
+
+			await message.reply_text(self.__download_queued_message)
 
 		@TelegramBotErrorHandler.command_handler(
 			command_usage="/video <download url> or /video <format> <download url>\n/formats for available formats"
@@ -172,6 +232,7 @@ class TelegramBot:
 				raise ValueError()
 
 			chat_id = message.chat.id
+			user_id = message.from_user.id if message.from_user is not None else chat_id
 
 			# Check arguments
 			if len(args) == 2:
@@ -179,17 +240,17 @@ class TelegramBot:
 			else:
 				url, dl_format_name = args[0], None
 
-			await message.reply_text("⬇️📽️ Download Starting...")
-
-			dt = DownloadThread(
-				downloader=self.downloader,
-				media_sender=self.media_sender,
+			if not self.__try_start_download_thread(
 				url=url,
+				user_id=user_id,
 				chat_id=chat_id,
 				content_type=ContentType.VIDEO,
 				dl_format_name=dl_format_name,
-			)
-			dt.start()
+			):
+				await message.reply_text(self.__user_download_limit_message)
+				return
+
+			await message.reply_text(self.__download_queued_message)
 
 		@TelegramBotErrorHandler.command_handler(command_usage="/search <query>")
 		@TelegramBotCommandInterceptor.secured_command(function_claims={"all", "search"})
@@ -288,6 +349,7 @@ class TelegramBot:
 				return
 
 			chat_id = query.message.chat.id
+			user_id = query.from_user.id
 			url = user_data["selected_url"]
 			data = query.data
 
@@ -296,34 +358,42 @@ class TelegramBot:
 			del user_data["urls"]
 
 			if data == "{{audio}}":
-				await query.edit_message_text(
-					text=f"⬇️🎧 Download Starting...\n\nDownloading from\n{url}", reply_markup=None
-				)
-
-				dt = DownloadThread(
-					downloader=self.downloader,
-					media_sender=self.media_sender,
+				if not self.__try_start_download_thread(
 					url=url,
+					user_id=user_id,
 					chat_id=chat_id,
 					content_type=ContentType.AUDIO,
 					dl_format_name=None,
+				):
+					await query.edit_message_text(
+						text=self.__user_download_limit_message,
+						reply_markup=None,
+					)
+					return
+
+				await query.edit_message_text(
+					text=f"{self.__download_queued_message}\n\nDownloading from\n{url}",
+					reply_markup=None,
 				)
-				dt.start()
 
 			if data == "{{video}}":
-				await query.edit_message_text(
-					text=f"⬇️📽️ Download Starting...\n\nDownloading from\n{url}", reply_markup=None
-				)
-
-				dt = DownloadThread(
-					downloader=self.downloader,
-					media_sender=self.media_sender,
+				if not self.__try_start_download_thread(
 					url=url,
+					user_id=user_id,
 					chat_id=chat_id,
 					content_type=ContentType.VIDEO,
 					dl_format_name=None,
+				):
+					await query.edit_message_text(
+						text=self.__user_download_limit_message,
+						reply_markup=None,
+					)
+					return
+
+				await query.edit_message_text(
+					text=f"{self.__download_queued_message}\n\nDownloading from\n{url}",
+					reply_markup=None,
 				)
-				dt.start()
 
 		async def default_message_handler(
 			update: Update, context: ContextTypes.DEFAULT_TYPE

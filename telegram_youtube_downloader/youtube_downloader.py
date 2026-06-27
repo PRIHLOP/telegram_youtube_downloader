@@ -1,6 +1,5 @@
 import os
 import re
-import shutil
 import logging
 import pathlib
 import datetime
@@ -10,6 +9,7 @@ import yt_dlp as yt
 from yt_dlp.utils import DownloadError as YtDlpDownloadError
 
 from telegram_youtube_downloader.data.dl_format import DlFormat
+from telegram_youtube_downloader.utils.file_utils import FileUtils
 from telegram_youtube_downloader.utils.config_utils import ConfigUtils
 from telegram_youtube_downloader.youtube_dl_options import YoutubeDlOptions
 from telegram_youtube_downloader.statics.content_type import ContentType
@@ -109,18 +109,15 @@ class YoutubeDownloader:
 		# Delete folder on exception
 		except YtDlpDownloadError as de:
 			self.__logger.warning(str(de))
-			self.__logger.info(f"Deleting folder {options['save_dir']}")
-			shutil.rmtree(options["save_dir"], ignore_errors=True)
+			FileUtils.delete_directory(options["save_dir"], self.__logger)
 			raise DownloadError("Download error (yt_dlp download error)")
 		except DownloadError as de:
 			self.__logger.warning(str(de))
-			self.__logger.info(f"Deleting folder {options['save_dir']}")
-			shutil.rmtree(options["save_dir"], ignore_errors=True)
+			FileUtils.delete_directory(options["save_dir"], self.__logger)
 			raise de
 		except Exception:
 			self.__logger.error("Unknown error", exc_info=True)
-			self.__logger.info(f"Deleting folder {options['save_dir']}")
-			shutil.rmtree(options["save_dir"], ignore_errors=True)
+			FileUtils.delete_directory(options["save_dir"], self.__logger)
 			raise DownloadError()
 
 	def __get_download_format_from_name(

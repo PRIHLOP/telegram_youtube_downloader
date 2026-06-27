@@ -24,6 +24,10 @@
 # Example for setting default command
 export telegram_bot_options__default_command=video
 
+# Example for setting active download/upload thread limit
+export telegram_bot_options__max_parallel_downloads=5
+export telegram_bot_options__max_parallel_downloads_per_user=1
+
 # Example for setting cookiefile for audio and video options
 export youtube_downloader_options__audio_options__cookiefile=/home/user/cookies.txt
 export youtube_downloader_options__video_options__cookiefile=/home/user/cookies.txt
@@ -63,7 +67,11 @@ telegram_bot_options:
   text_timeout_seconds: 30
   video_timeout_seconds: 300 
   audio_timeout_seconds: 300
+  max_parallel_downloads: 5
+  max_parallel_downloads_per_user: 1
 ```
+`max_parallel_downloads` limits global active download/upload threads. Accepted requests wait in a queue when all global slots are busy.
+`max_parallel_downloads_per_user` limits queued or active requests from one Telegram user.
 
 ### `base_url`
 ### Base url of the telegram api server, set this if you are using a custom api server. [See usage with api server](https://github.com/cccaaannn/telegram_youtube_downloader/blob/master/docs/API_SERVER.md)
@@ -217,6 +225,8 @@ telegram_bot_options:
   text_timeout_seconds: 30                        # 30 sec
   video_timeout_seconds: 300                      # 5 min  
   audio_timeout_seconds: 300                      # 5 min
+  max_parallel_downloads: 5                       # Maximum active download/upload threads
+  max_parallel_downloads_per_user: 1              # Maximum queued/active downloads per user
 
   base_url: null                                  # See docs/CONFIGURATIONS.md for more information (Ex: http://telegram-bot-api:8081/bot)
   default_command: null                           # audio,video,null docs/CONFIGURATIONS.md for more information

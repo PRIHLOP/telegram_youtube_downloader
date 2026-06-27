@@ -18,6 +18,8 @@ class DownloadThread(threading.Thread):
 		chat_id: int,
 		content_type: ContentType,
 		dl_format_name: "str | None",
+		download_semaphore: threading.Semaphore,
+		user_download_semaphore: threading.Semaphore,
 	) -> None:
 		super().__init__()
 		self.__logger = logging.getLogger(f"tyd.{self.__class__.__name__}")
@@ -27,6 +29,8 @@ class DownloadThread(threading.Thread):
 		self.chat_id = chat_id
 		self.content_type = content_type
 		self.dl_format_name = dl_format_name
+		self.download_semaphore = download_semaphore
+		self.user_download_semaphore = user_download_semaphore
 
 	def __run_for_audio(self) -> None:
 		download_start = time.time()
@@ -79,13 +83,20 @@ class DownloadThread(threading.Thread):
 		)
 
 	def run(self) -> None:
-		self.__logger.info(f"Download started for url {self.url}")
+		self.__logger.info(f"Download queued for url {self.url}")
+		download_slot_acquired = False
 
 		try:
+			self.download_semaphore.acquire()
+			download_slot_acquired = True
+			self.__logger.info(f"Download started for url {self.url}")
+
 			# TODO Might convert to inheritance later
 			if self.content_type == ContentType.AUDIO:
+				self.media_sender.send_text(self.chat_id, "⬇️🎧 Download Starting...")
 				self.__run_for_audio()
 			elif self.content_type == ContentType.VIDEO:
+				self.media_sender.send_text(self.chat_id, "⬇️📽️ Download Starting...")
 				self.__run_for_video()
 			else:
 				pass
@@ -110,3 +121,7 @@ class DownloadThread(threading.Thread):
 					f"User notifying attempt (via message) for an error failed due to another error during message sending, {str(e)}",
 					exc_info=True,
 				)
+		finally:
+			if download_slot_acquired:
+				self.download_semaphore.release()
+			self.user_download_semaphore.release()

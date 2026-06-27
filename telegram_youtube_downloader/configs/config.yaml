@@ -11,6 +11,8 @@ telegram_bot_options:
   text_timeout_seconds: 30                        # 30 sec
   video_timeout_seconds: 300                      # 5 min  
   audio_timeout_seconds: 300                      # 5 min
+  max_parallel_downloads: 5                       # Maximum active download/upload threads
+  max_parallel_downloads_per_user: 1              # Maximum queued/active downloads per user
 
   base_url: null                                  # See docs/API_SERVER.md for more information (Ex: http://telegram-bot-api:8081/bot)
   default_command: null                           # audio,video,null docs/CONFIGURATIONS.md for more information
