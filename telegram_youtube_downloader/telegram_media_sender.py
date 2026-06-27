@@ -2,6 +2,7 @@ import os
 import uuid
 import logging
 import pathlib
+import subprocess
 
 import requests
 
@@ -88,9 +89,10 @@ class TelegramMediaSender:
 	"""Custom media sender class for telegrams native api"""
 
 	__default_telegram_api_url = "https://api.telegram.org/bot"
-	__max_telegram_upload_size_bytes = 200 * 1024 * 1024
+	__max_telegram_upload_size_bytes = 230 * 1024 * 1024
 	__file_split_chunk_size_bytes = 8 * 1024 * 1024
 	__multipart_content_type = "application/octet-stream"
+	__media_segment_target_size_bytes = 200 * 1024 * 1024
 
 	def __init__(self) -> None:
 		self.__telegram_options = ConfigUtils.get_app_config().telegram_bot_options
@@ -105,11 +107,124 @@ class TelegramMediaSender:
 		folder_name, _ = os.path.split(file_path)
 		FileUtils.delete_directory(folder_name, self.__logger)
 
+	def __delete_directory(self, directory_path: str) -> None:
+		FileUtils.delete_directory(directory_path, self.__logger)
+
 	def __get_split_file_name(self, file_name: str, part_number: int, part_count: int) -> str:
 		file_path = pathlib.Path(file_name)
 		part_suffix = f".part{part_number:03d}-of-{part_count:03d}"
 
 		return f"{file_path.stem}{part_suffix}{file_path.suffix}"
+
+	def __get_media_duration_seconds(self, file_path: str) -> float:
+		try:
+			result = subprocess.run(
+				[
+					"ffprobe",
+					"-v",
+					"error",
+					"-show_entries",
+					"format=duration",
+					"-of",
+					"default=noprint_wrappers=1:nokey=1",
+					file_path,
+				],
+				capture_output=True,
+				check=True,
+				text=True,
+			)
+			duration = float(result.stdout.strip())
+		except Exception:
+			self.__logger.error(f"Could not get media duration: {file_path}", exc_info=True)
+			raise SendError("Could not split media file")
+
+		if duration <= 0:
+			self.__logger.error(f"Invalid media duration '{duration}' for file: {file_path}")
+			raise SendError("Could not split media file")
+
+		return duration
+
+	def __get_segment_time_seconds(self, file_path: str, target_size_bytes: int) -> int:
+		file_size = os.path.getsize(file_path)
+		duration = self.__get_media_duration_seconds(file_path)
+		bytes_per_second = file_size / duration
+
+		return max(1, int(target_size_bytes / bytes_per_second))
+
+	def __build_segment_file_name_template(self, file_path: str, file_name: str) -> str:
+		download_dir = os.path.dirname(file_path)
+		file_name_path = pathlib.Path(file_name)
+		segment_dir = os.path.join(download_dir, "segments")
+		pathlib.Path(segment_dir).mkdir(parents=True, exist_ok=True)
+
+		return os.path.join(segment_dir, f"{file_name_path.stem}.part%03d{file_name_path.suffix}")
+
+	def __split_media_file(self, file_path: str, file_name: str) -> list[tuple[str, str]]:
+		segment_file_name_template = self.__build_segment_file_name_template(file_path, file_name)
+		segment_dir = os.path.dirname(segment_file_name_template)
+		segment_time = self.__get_segment_time_seconds(
+			file_path,
+			self.__media_segment_target_size_bytes,
+		)
+
+		self.__delete_directory(segment_dir)
+		pathlib.Path(segment_dir).mkdir(parents=True, exist_ok=True)
+
+		self.__logger.info(f"Splitting media file '{file_path}' with segment_time={segment_time}")
+		result = subprocess.run(
+			[
+				"ffmpeg",
+				"-y",
+				"-i",
+				file_path,
+				"-map",
+				"0",
+				"-c",
+				"copy",
+				"-f",
+				"segment",
+				"-segment_time",
+				str(segment_time),
+				"-reset_timestamps",
+				"1",
+				segment_file_name_template,
+			],
+			capture_output=True,
+			text=True,
+		)
+
+		if result.returncode != 0:
+			self.__logger.error(
+				f"Could not split media file, ffmpeg exit code {result.returncode}, stderr={result.stderr[-1000:]}"
+			)
+			raise SendError("Could not split media file")
+
+		segment_paths = sorted(
+			os.path.join(segment_dir, file_name)
+			for file_name in os.listdir(segment_dir)
+			if os.path.isfile(os.path.join(segment_dir, file_name))
+		)
+
+		if not segment_paths:
+			self.__logger.error(f"Media split produced no segments: {file_path}")
+			raise SendError("Could not split media file")
+
+		largest_segment_size = max(os.path.getsize(segment_path) for segment_path in segment_paths)
+		if largest_segment_size > self.__max_telegram_upload_size_bytes:
+			self.__logger.error(
+				f"Largest segment is too large ({largest_segment_size} bytes), "
+				f"max upload size is {self.__max_telegram_upload_size_bytes} bytes"
+			)
+			raise SendError("Could not split media file below Telegram upload limit")
+
+		part_count = len(segment_paths)
+		return [
+			(
+				segment_path,
+				self.__get_split_file_name(file_name, index, part_count),
+			)
+			for index, segment_path in enumerate(segment_paths, start=1)
+		]
 
 	def __get_multipart_field(self, boundary: str, name: str, value: str) -> bytes:
 		return (
@@ -168,64 +283,53 @@ class TelegramMediaSender:
 			)
 			raise SendError("Telegram returned non-json response")
 
-	def __get_part_count(self, file_path: str) -> int:
-		file_size = os.path.getsize(file_path)
-		return (
-			file_size + self.__max_telegram_upload_size_bytes - 1
-		) // self.__max_telegram_upload_size_bytes
-
-	def __send_document(
-		self,
-		chat_id: int,
-		file_path: str,
-		file_name: str,
-		file_offset: int = 0,
-		file_size: "int | None" = None,
-	) -> None:
-		payload = {"chat_id": chat_id, "caption": file_name, "parse_mode": "HTML"}
-		url = f"{self.__base_url}{self.__bot_key}/sendDocument"
-		timeout = self.__telegram_options.video_timeout_seconds
+	def __send_audio_file(self, chat_id: int, file_path: str, file_name: str) -> None:
+		payload = {"chat_id": chat_id, "title": file_name, "parse_mode": "HTML"}
+		url = f"{self.__base_url}{self.__bot_key}/sendAudio"
+		timeout = self.__telegram_options.audio_timeout_seconds
 
 		resp = self.__post_multipart_file(
 			url=url,
 			payload=payload,
-			file_field_name="document",
+			file_field_name="audio",
 			file_path=file_path,
 			file_name=file_name,
 			timeout=timeout,
-			file_offset=file_offset,
-			file_size=file_size,
 		)
 		self.__logger.info(resp)
 
 		if not resp["ok"]:
 			self.__logger.warning(resp)
-			raise SendError(f"Could not send document, Telegram: {resp['description']}")
+			raise SendError(f"Could not send audio, Telegram: {resp['description']}")
 
-	def __send_split_file(self, chat_id: int, file_path: str, file_name: str) -> None:
-		file_size = os.path.getsize(file_path)
-		part_count = self.__get_part_count(file_path)
+	def __send_video_file(self, chat_id: int, file_path: str, file_name: str) -> None:
+		payload = {"chat_id": chat_id, "title": file_name, "parse_mode": "HTML"}
+		url = f"{self.__base_url}{self.__bot_key}/sendVideo"
+		timeout = self.__telegram_options.video_timeout_seconds
 
-		self.__logger.info(
-			f"Sending file '{file_path}' in {part_count} parts, "
-			f"max part size {self.__max_telegram_upload_size_bytes} bytes"
+		resp = self.__post_multipart_file(
+			url=url,
+			payload=payload,
+			file_field_name="video",
+			file_path=file_path,
+			file_name=file_name,
+			timeout=timeout,
 		)
+		self.__logger.info(resp)
 
-		for part_number in range(1, part_count + 1):
-			file_offset = (part_number - 1) * self.__max_telegram_upload_size_bytes
-			part_size = min(
-				self.__max_telegram_upload_size_bytes,
-				file_size - file_offset,
-			)
-			part_file_name = self.__get_split_file_name(file_name, part_number, part_count)
+		if not resp["ok"]:
+			self.__logger.warning(resp)
+			raise SendError(f"Could not send video, Telegram: {resp['description']}")
 
-			self.__send_document(
-				chat_id=chat_id,
-				file_path=file_path,
-				file_name=part_file_name,
-				file_offset=file_offset,
-				file_size=part_size,
-			)
+	def __send_split_audio(self, chat_id: int, file_path: str, file_name: str) -> None:
+		segment_files = self.__split_media_file(file_path, file_name)
+		for segment_file_path, segment_file_name in segment_files:
+			self.__send_audio_file(chat_id, segment_file_path, segment_file_name)
+
+	def __send_split_video(self, chat_id: int, file_path: str, file_name: str) -> None:
+		segment_files = self.__split_media_file(file_path, file_name)
+		for segment_file_path, segment_file_name in segment_files:
+			self.__send_video_file(chat_id, segment_file_path, segment_file_name)
 
 	def send_text(self, chat_id: int, text: str) -> None:
 		try:
@@ -248,26 +352,10 @@ class TelegramMediaSender:
 	def send_audio(self, chat_id: int, file_path: str, file_name: str, remove=False) -> None:
 		try:
 			if os.path.getsize(file_path) > self.__max_telegram_upload_size_bytes:
-				self.__send_split_file(chat_id=chat_id, file_path=file_path, file_name=file_name)
+				self.__send_split_audio(chat_id=chat_id, file_path=file_path, file_name=file_name)
 				return
 
-			payload = {"chat_id": chat_id, "title": file_name, "parse_mode": "HTML"}
-			url = f"{self.__base_url}{self.__bot_key}/sendAudio"
-			timeout = self.__telegram_options.audio_timeout_seconds
-
-			resp = self.__post_multipart_file(
-				url=url,
-				payload=payload,
-				file_field_name="audio",
-				file_path=file_path,
-				file_name=file_name,
-				timeout=timeout,
-			)
-			self.__logger.info(resp)
-
-			if not resp["ok"]:
-				self.__logger.warning(resp)
-				raise SendError(f"Could not send audio, Telegram: {resp['description']}")
+			self.__send_audio_file(chat_id, file_path, file_name)
 
 		except requests.Timeout:
 			self.__logger.warning("Could not send audio, timeout")
@@ -288,26 +376,10 @@ class TelegramMediaSender:
 	def send_video(self, chat_id: int, file_path: str, file_name: str, remove=False) -> None:
 		try:
 			if os.path.getsize(file_path) > self.__max_telegram_upload_size_bytes:
-				self.__send_split_file(chat_id=chat_id, file_path=file_path, file_name=file_name)
+				self.__send_split_video(chat_id=chat_id, file_path=file_path, file_name=file_name)
 				return
 
-			payload = {"chat_id": chat_id, "title": file_name, "parse_mode": "HTML"}
-			url = f"{self.__base_url}{self.__bot_key}/sendVideo"
-			timeout = self.__telegram_options.video_timeout_seconds
-
-			resp = self.__post_multipart_file(
-				url=url,
-				payload=payload,
-				file_field_name="video",
-				file_path=file_path,
-				file_name=file_name,
-				timeout=timeout,
-			)
-			self.__logger.info(resp)
-
-			if not resp["ok"]:
-				self.__logger.warning(resp)
-				raise SendError(f"Could not send video, Telegram: {resp['description']}")
+			self.__send_video_file(chat_id, file_path, file_name)
 
 		except requests.Timeout:
 			self.__logger.warning("Could not send video, timeout")

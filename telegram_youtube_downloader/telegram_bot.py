@@ -79,7 +79,7 @@ class TelegramBot:
 		chat_id: int,
 		content_type: ContentType,
 		dl_format_name: "str | None",
-	) -> bool:
+	) -> "bool | None":
 		with self.__user_download_semaphores_lock:
 			user_download_semaphore = self.__user_download_semaphores.setdefault(
 				user_id,
@@ -88,7 +88,10 @@ class TelegramBot:
 
 		if not user_download_semaphore.acquire(blocking=False):
 			self.__logger.info(f"Download rejected because user limit is reached ({user_id})")
-			return False
+			return None
+
+		download_slot_acquired = self.__download_semaphore.acquire(blocking=False)
+		is_queued = not download_slot_acquired
 
 		dt = DownloadThread(
 			downloader=self.downloader,
@@ -99,15 +102,18 @@ class TelegramBot:
 			dl_format_name=dl_format_name,
 			download_semaphore=self.__download_semaphore,
 			user_download_semaphore=user_download_semaphore,
+			download_slot_acquired=download_slot_acquired,
 		)
 
 		try:
 			dt.start()
 		except Exception:
+			if download_slot_acquired:
+				self.__download_semaphore.release()
 			user_download_semaphore.release()
 			raise
 
-		return True
+		return is_queued
 
 	def start(self):
 		"""Starts pooling (blocking)"""
@@ -207,17 +213,19 @@ class TelegramBot:
 			else:
 				url, dl_format_name = args[0], None
 
-			if not self.__try_start_download_thread(
+			is_queued = self.__try_start_download_thread(
 				url=url,
 				user_id=user_id,
 				chat_id=chat_id,
 				content_type=ContentType.AUDIO,
 				dl_format_name=dl_format_name,
-			):
+			)
+			if is_queued is None:
 				await message.reply_text(self.__user_download_limit_message)
 				return
 
-			await message.reply_text(self.__download_queued_message)
+			if is_queued:
+				await message.reply_text(self.__download_queued_message)
 
 		@TelegramBotErrorHandler.command_handler(
 			command_usage="/video <download url> or /video <format> <download url>\n/formats for available formats"
@@ -240,17 +248,19 @@ class TelegramBot:
 			else:
 				url, dl_format_name = args[0], None
 
-			if not self.__try_start_download_thread(
+			is_queued = self.__try_start_download_thread(
 				url=url,
 				user_id=user_id,
 				chat_id=chat_id,
 				content_type=ContentType.VIDEO,
 				dl_format_name=dl_format_name,
-			):
+			)
+			if is_queued is None:
 				await message.reply_text(self.__user_download_limit_message)
 				return
 
-			await message.reply_text(self.__download_queued_message)
+			if is_queued:
+				await message.reply_text(self.__download_queued_message)
 
 		@TelegramBotErrorHandler.command_handler(command_usage="/search <query>")
 		@TelegramBotCommandInterceptor.secured_command(function_claims={"all", "search"})
@@ -358,13 +368,14 @@ class TelegramBot:
 			del user_data["urls"]
 
 			if data == "{{audio}}":
-				if not self.__try_start_download_thread(
+				is_queued = self.__try_start_download_thread(
 					url=url,
 					user_id=user_id,
 					chat_id=chat_id,
 					content_type=ContentType.AUDIO,
 					dl_format_name=None,
-				):
+				)
+				if is_queued is None:
 					await query.edit_message_text(
 						text=self.__user_download_limit_message,
 						reply_markup=None,
@@ -372,18 +383,23 @@ class TelegramBot:
 					return
 
 				await query.edit_message_text(
-					text=f"{self.__download_queued_message}\n\nDownloading from\n{url}",
+					text=(
+						f"{self.__download_queued_message}\n\nDownloading from\n{url}"
+						if is_queued
+						else f"⬇️🎧 Download Starting...\n\nDownloading from\n{url}"
+					),
 					reply_markup=None,
 				)
 
 			if data == "{{video}}":
-				if not self.__try_start_download_thread(
+				is_queued = self.__try_start_download_thread(
 					url=url,
 					user_id=user_id,
 					chat_id=chat_id,
 					content_type=ContentType.VIDEO,
 					dl_format_name=None,
-				):
+				)
+				if is_queued is None:
 					await query.edit_message_text(
 						text=self.__user_download_limit_message,
 						reply_markup=None,
@@ -391,7 +407,11 @@ class TelegramBot:
 					return
 
 				await query.edit_message_text(
-					text=f"{self.__download_queued_message}\n\nDownloading from\n{url}",
+					text=(
+						f"{self.__download_queued_message}\n\nDownloading from\n{url}"
+						if is_queued
+						else f"⬇️📽️ Download Starting...\n\nDownloading from\n{url}"
+					),
 					reply_markup=None,
 				)
 

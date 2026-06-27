@@ -20,6 +20,7 @@ class DownloadThread(threading.Thread):
 		dl_format_name: "str | None",
 		download_semaphore: threading.Semaphore,
 		user_download_semaphore: threading.Semaphore,
+		download_slot_acquired: bool,
 	) -> None:
 		super().__init__()
 		self.__logger = logging.getLogger(f"tyd.{self.__class__.__name__}")
@@ -31,6 +32,7 @@ class DownloadThread(threading.Thread):
 		self.dl_format_name = dl_format_name
 		self.download_semaphore = download_semaphore
 		self.user_download_semaphore = user_download_semaphore
+		self.download_slot_acquired = download_slot_acquired
 
 	def __run_for_audio(self) -> None:
 		download_start = time.time()
@@ -84,11 +86,12 @@ class DownloadThread(threading.Thread):
 
 	def run(self) -> None:
 		self.__logger.info(f"Download queued for url {self.url}")
-		download_slot_acquired = False
 
 		try:
-			self.download_semaphore.acquire()
-			download_slot_acquired = True
+			if not self.download_slot_acquired:
+				self.download_semaphore.acquire()
+				self.download_slot_acquired = True
+
 			self.__logger.info(f"Download started for url {self.url}")
 
 			# TODO Might convert to inheritance later
@@ -122,6 +125,6 @@ class DownloadThread(threading.Thread):
 					exc_info=True,
 				)
 		finally:
-			if download_slot_acquired:
+			if self.download_slot_acquired:
 				self.download_semaphore.release()
 			self.user_download_semaphore.release()
