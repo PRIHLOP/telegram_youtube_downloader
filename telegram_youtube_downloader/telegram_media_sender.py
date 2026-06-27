@@ -2,7 +2,6 @@ import os
 import uuid
 import logging
 import pathlib
-from collections.abc import Iterator
 
 import requests
 
@@ -10,6 +9,79 @@ from telegram_youtube_downloader.utils.file_utils import FileUtils
 from telegram_youtube_downloader.errors.send_error import SendError
 from telegram_youtube_downloader.utils.config_utils import ConfigUtils
 from telegram_youtube_downloader.utils.api_key_utils import ApiKeyUtils
+
+
+class MultipartFileStream:
+	def __init__(
+		self,
+		prefix: bytes,
+		suffix: bytes,
+		file_path: str,
+		file_offset: int,
+		file_size: int,
+		chunk_size: int,
+	) -> None:
+		self.__prefix = prefix
+		self.__suffix = suffix
+		self.__file_path = file_path
+		self.__file_offset = file_offset
+		self.__file_size = file_size
+		self.__chunk_size = chunk_size
+		self.__content_length = len(prefix) + file_size + len(suffix)
+
+		self.__prefix_offset = 0
+		self.__suffix_offset = 0
+		self.__remaining_file_size = file_size
+		self.__file = open(file_path, "rb")
+		self.__file.seek(file_offset)
+
+	def __len__(self) -> int:
+		return self.__content_length
+
+	def close(self) -> None:
+		self.__file.close()
+
+	def read(self, size: int = -1) -> bytes:
+		if size == 0:
+			return b""
+
+		remaining_read_size = self.__chunk_size if size < 0 else size
+		chunks = []
+
+		while remaining_read_size > 0:
+			if self.__prefix_offset < len(self.__prefix):
+				chunk = self.__prefix[
+					self.__prefix_offset : self.__prefix_offset + remaining_read_size
+				]
+				self.__prefix_offset += len(chunk)
+
+			elif self.__remaining_file_size > 0:
+				chunk = self.__file.read(
+					min(
+						self.__chunk_size,
+						remaining_read_size,
+						self.__remaining_file_size,
+					)
+				)
+				self.__remaining_file_size -= len(chunk)
+
+			elif self.__suffix_offset < len(self.__suffix):
+				chunk = self.__suffix[
+					self.__suffix_offset : self.__suffix_offset + remaining_read_size
+				]
+				self.__suffix_offset += len(chunk)
+
+			else:
+				self.close()
+				break
+
+			if not chunk:
+				break
+
+			chunks.append(chunk)
+			remaining_read_size -= len(chunk)
+
+		return b"".join(chunks)
 
 
 class TelegramMediaSender:
@@ -51,30 +123,6 @@ class TelegramMediaSender:
 			f"Content-Type: {self.__multipart_content_type}\r\n\r\n"
 		).encode()
 
-	def __iter_multipart_body(
-		self,
-		prefix: bytes,
-		suffix: bytes,
-		file_path: str,
-		file_offset: int,
-		file_size: int,
-	) -> Iterator[bytes]:
-		yield prefix
-
-		with open(file_path, "rb") as file:
-			file.seek(file_offset)
-			remaining_size = file_size
-
-			while remaining_size > 0:
-				chunk = file.read(min(self.__file_split_chunk_size_bytes, remaining_size))
-				if not chunk:
-					break
-
-				yield chunk
-				remaining_size -= len(chunk)
-
-		yield suffix
-
 	def __post_multipart_file(
 		self,
 		url: str,
@@ -94,14 +142,31 @@ class TelegramMediaSender:
 		)
 		prefix += self.__get_multipart_file_header(boundary, file_field_name, file_name)
 		suffix = f"\r\n--{boundary}--\r\n".encode()
-		content_length = len(prefix) + file_size + len(suffix)
 		headers = {
 			"Content-Type": f"multipart/form-data; boundary={boundary}",
-			"Content-Length": str(content_length),
 		}
-		body = self.__iter_multipart_body(prefix, suffix, file_path, file_offset, file_size)
+		body = MultipartFileStream(
+			prefix=prefix,
+			suffix=suffix,
+			file_path=file_path,
+			file_offset=file_offset,
+			file_size=file_size,
+			chunk_size=self.__file_split_chunk_size_bytes,
+		)
 
-		return requests.post(url, data=body, headers=headers, timeout=timeout).json()
+		try:
+			resp = requests.post(url, data=body, headers=headers, timeout=timeout)
+		finally:
+			body.close()
+
+		try:
+			return resp.json()
+		except requests.JSONDecodeError:
+			self.__logger.error(
+				f"Telegram returned non-json response, status={resp.status_code}, "
+				f"content_type={resp.headers.get('content-type')}, body={resp.text[:500]}"
+			)
+			raise SendError("Telegram returned non-json response")
 
 	def __get_part_count(self, file_path: str) -> int:
 		file_size = os.path.getsize(file_path)
